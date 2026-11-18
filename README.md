@@ -10,15 +10,15 @@
 ## 要件
 
 - Python 3.11 以上
-- `websockets>=14,<17`
+- `uv`（`websockets>=14,<17` は `uv sync` でインストール）
 - Experimental API に対応した Codex App Server
 - 既存の App Server に接続可能な **WebSocket / Unix socket endpoint** があること（stdio-only の既存プロセスには直接 attach できません）
 
 ## 実行
 
 ```bash
-python -m pip install -r requirements.txt
-python codex_project_assigner.py --url ws://127.0.0.1:4500
+uv sync
+uv run python codex_project_assigner.py --url ws://127.0.0.1:4500
 ```
 
 Codex App Server が WebSocket で待ち受けている場合のコマンド例は `codex app-server --listen ws://127.0.0.1:4500` です。ただし、これは**新しいサーバーを起動するコマンド**です。すでに動いている App Server を再利用する場合は、その既存プロセスの endpoint を `--url` で指定してください。
@@ -26,7 +26,7 @@ Codex App Server が WebSocket で待ち受けている場合のコマンド例�
 Unix socket の待受先がある場合:
 
 ```bash
-python codex_project_assigner.py --unix-socket /path/to/codex-app-server.sock
+uv run python codex_project_assigner.py --unix-socket /path/to/codex-app-server.sock
 ```
 
 認証付き WebSocket の場合は、トークンをコマンド引数に直接書かず、環境変数 `CODEX_APP_SERVER_TOKEN` に設定してください。非ローカル接続は `wss://` または SSH トンネルで保護してください。
@@ -51,7 +51,7 @@ python codex_project_assigner.py --unix-socket /path/to/codex-app-server.sock
 ## テスト
 
 ```bash
-python -m unittest -v test_codex_project_assigner.py
+uv run python -m unittest -v test_codex_project_assigner.py
 ```
 
 単体・擬似 WebSocket 統合テスト 11 ケースを実施済み。実際の Codex App Server への接続テストは未実施です。

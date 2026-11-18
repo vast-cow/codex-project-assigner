@@ -1,0 +1,5 @@
+[project]
+name = "codex-project-assigner"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["websockets>=14,<17"]
