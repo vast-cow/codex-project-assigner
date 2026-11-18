@@ -31,10 +31,24 @@ uv run python codex_project_assigner.py --unix-socket /path/to/codex-app-server.
 
 For an authenticated WebSocket, set the token in the `CODEX_APP_SERVER_TOKEN` environment variable instead of putting it directly in the command-line arguments. Protect non-local connections with `wss://` or an SSH tunnel.
 
+### Backfill existing threads once
+
+```bash
+uv run python codex_project_assigner.py --url ws://127.0.0.1:4500 --backfill-once
+uv run python codex_project_assigner.py --unix-socket /path/to/codex-app-server.sock --backfill-once
+```
+
+Backfill scans the unassigned history exposed by `thread/list`, including archived threads, with no age cutoff. It reuses or creates projects using the same exact working-directory matching as the watcher. It preserves existing assignments and skips ephemeral threads and threads without a valid absolute working directory.
+
+The command prints assigned, skipped, and failed counts and exits. A listing or processing failure causes a non-zero exit status. You can rerun the command to pick up remaining unassigned threads. The same endpoint and authentication options apply.
+
+`--lookback-seconds` sets the watcher's startup cutoff for recovering missed threads, and `--reconcile-interval` controls how often the watcher checks for them. Backfill ignores both options and exits after one pass through the history.
+
 ## Options
 
-- `--lookback-seconds 300`: Also recover unassigned threads created in the five minutes before startup. Older existing threads are not modified.
-- `--reconcile-interval 60`: Every 60 seconds, use `thread/list` to recover threads missed during disconnections or event loss.
+- `--backfill-once`: Assign existing unassigned threads of any age, then exit.
+- `--lookback-seconds 300`: In watcher mode, also recover unassigned threads created in the five minutes before startup.
+- `--reconcile-interval 60`: In watcher mode, use `thread/list` every 60 seconds to recover threads missed during disconnections or event loss.
 - `--request-timeout 20`: JSON-RPC request timeout, in seconds.
 - `--log-level DEBUG`: Enable detailed logging.
 
@@ -54,7 +68,7 @@ For an authenticated WebSocket, set the token in the `CODEX_APP_SERVER_TOKEN` en
 uv run python -m unittest -v test_codex_project_assigner.py
 ```
 
-Eleven unit and simulated WebSocket integration test cases have been run. Connection testing against a real Codex App Server has not been performed.
+The suite covers assignment, historical backfill, and a simulated WebSocket connection. Connection testing against a real Codex App Server has not been performed.
 
 ## Protocol References
 

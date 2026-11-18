@@ -1,12 +1,17 @@
 """Offline unit tests; no Codex instance is required."""
 import asyncio
 import copy
+import io
+import json
+import os
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from codex_project_assigner import ProjectAssigner, normalized_path, project_name
+from codex_project_assigner import ProjectAssigner, RpcError, main, normalized_path, project_name
 
 
 class FakeRpc:
@@ -56,7 +61,7 @@ class FakeRpc:
         if method == "thread/list":
             threads = [
                 t for t in sorted(self.threads.values(), key=lambda t: t["createdAt"], reverse=True)
-                if t.get("projectId") is None
+                if t.get("projectId") is None and t.get("archived", False) == params.get("archived", False)
             ]
             offset = int(params.get("cursor", "0"))
             count = min(params.get("limit", 100), self.page_size)
@@ -188,8 +193,211 @@ class AssignerTests(unittest.IsolatedAsyncioTestCase):
             normalized_path("relative/path")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class BackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def run_backfill(self, rpc):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = await ProjectAssigner(rpc, backfill=True).backfill_once()
+        return status, output.getvalue().strip()
+
+    async def test_lists_all_pages_before_assigning_threads_of_any_age(self):
+        rpc = FakeRpc(
+            projects=[project("existing", "/repos/app/")],
+            threads=[
+                thread("older", "/repos/x/../app", created_at=10),
+                thread("oldest", "/repos/app", created_at=1),
+                thread("historical", "/repos/new", created_at=20),
+                thread("shared", "/repos/new/", created_at=30),
+                dict(thread("archived", created_at=5), archived=True),
+                thread("no-timestamp", created_at=0),
+            ],
+        )
+        original_call = rpc.call
+
+        async def call(method, params):
+            response = await original_call(method, params)
+            if method == "thread/list" and params.get("cursor") == "2":
+                response["data"].append({"id": "shared"})
+            if method == "thread/list" and not response["nextCursor"]:
+                for item in response["data"]:
+                    if item["id"] == "no-timestamp":
+                        item.pop("createdAt")
+            return response
+
+        rpc.call = call
+        self.assertEqual(await self.run_backfill(rpc), (
+            0, "Backfill summary: assigned=6, skipped=0, failed=0",
+        ))
+        self.assertEqual(rpc.created, 1)
+        self.assertEqual(rpc.updated, 6)
+        for tid in ("older", "oldest", "archived", "no-timestamp"):
+            self.assertEqual(rpc.threads[tid]["projectId"], "existing")
+        for tid in ("historical", "shared"):
+            self.assertEqual(rpc.threads[tid]["projectId"], "p-1")
+        listing = [params for method, params in rpc.calls if method == "thread/list"]
+        self.assertEqual([(p["archived"], p.get("cursor")) for p in listing], [
+            (False, None), (False, "2"), (False, "4"), (True, None),
+        ])
+        self.assertTrue(all(p["projectId"] is None and p["modelProviders"] == [] for p in listing))
+        self.assertTrue(all("exec" in p["sourceKinds"] for p in listing))
+        self.assertEqual([method for method, _ in rpc.calls[:4]], ["thread/list"] * 4)
+
+    async def test_skips_assigned_ephemeral_and_invalid_cwd_and_can_rerun(self):
+        rpc = FakeRpc(threads=[
+            thread("eligible"),
+            thread("assigned", project_id="by-user"),
+            thread("ephemeral", ephemeral=True),
+            thread("relative", cwd="repos/app"),
+            thread("missing", cwd=None),
+        ])
+        with self.assertLogs("codex-project-assigner", "WARNING"):
+            self.assertEqual(await self.run_backfill(rpc), (
+                0, "Backfill summary: assigned=1, skipped=3, failed=0",
+            ))
+            self.assertEqual(await self.run_backfill(rpc), (
+                0, "Backfill summary: assigned=0, skipped=3, failed=0",
+            ))
+        self.assertEqual(rpc.threads["assigned"]["projectId"], "by-user")
+        self.assertEqual(rpc.threads["eligible"]["projectId"], "p-1")
+        self.assertEqual(rpc.created, 1)
+        self.assertEqual(rpc.updated, 1)
+
+    async def test_rechecks_metadata_after_project_lookup(self):
+        changes = [
+            {"projectId": "by-user"},
+            {"ephemeral": True},
+            {"cwd": None},
+            {"cwd": "/repos/elsewhere"},
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                rpc = FakeRpc(projects=[project("existing", "/repos/app")], threads=[thread("t1")])
+                original_call = rpc.call
+
+                async def call(method, params):
+                    if method == "project/list":
+                        rpc.threads["t1"].update(change)
+                    return await original_call(method, params)
+
+                rpc.call = call
+                self.assertEqual(await self.run_backfill(rpc), (
+                    0, "Backfill summary: assigned=0, skipped=1, failed=0",
+                ))
+                self.assertEqual(rpc.updated, 0)
+
+    async def test_rechecks_metadata_after_stale_project_failure(self):
+        rpc = FakeRpc(projects=[project("existing", "/repos/app")], threads=[thread("t1")])
+        original_call = rpc.call
+
+        async def call(method, params):
+            if method == "thread/metadata/update":
+                rpc.updated += 1
+                rpc.projects[:] = [project("replacement", "/repos/app")]
+                rpc.threads["t1"]["projectId"] = "by-user"
+                raise RpcError(method, {"message": "project not found"})
+            return await original_call(method, params)
+
+        rpc.call = call
+        self.assertEqual(await self.run_backfill(rpc), (
+            0, "Backfill summary: assigned=0, skipped=1, failed=0",
+        ))
+        self.assertEqual(rpc.updated, 1)
+        self.assertEqual(rpc.threads["t1"]["projectId"], "by-user")
+
+    async def test_logs_read_failure_and_continues(self):
+        rpc = FakeRpc(threads=[thread("unreadable"), thread("eligible")])
+        original_call = rpc.call
+
+        async def call(method, params):
+            if method == "thread/read" and params["threadId"] == "unreadable":
+                raise RpcError(method, {"message": "thread not found"})
+            return await original_call(method, params)
+
+        rpc.call = call
+        with self.assertLogs("codex-project-assigner", "ERROR") as logs:
+            self.assertEqual(await self.run_backfill(rpc), (
+                1, "Backfill summary: assigned=1, skipped=0, failed=1",
+            ))
+        self.assertIn("unreadable", logs.output[0])
+        self.assertEqual(rpc.updated, 1)
+
+    async def test_repeated_cursor_fails_without_writes(self):
+        rpc = FakeRpc(threads=[thread("t1")])
+        original_call = rpc.call
+
+        async def call(method, params):
+            response = await original_call(method, params)
+            if method == "thread/list":
+                response["nextCursor"] = "0"
+            return response
+
+        rpc.call = call
+        with self.assertLogs("codex-project-assigner", "ERROR") as logs:
+            self.assertEqual(await self.run_backfill(rpc), (
+                1, "Backfill summary: assigned=0, skipped=0, failed=0",
+            ))
+        self.assertIn("invalid/repeated nextCursor", logs.output[0])
+        self.assertEqual(rpc.updated, 0)
+
+
+class BackfillCliTests(unittest.TestCase):
+    def test_cli_connects_once_and_ignores_events(self):
+        rpc = FakeRpc(threads=[thread("historical", created_at=1)])
+
+        class WebSocket:
+            async def __aenter__(self):
+                self.messages = asyncio.Queue()
+                return self
+
+            async def __aexit__(self, *exc):
+                pass
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await self.messages.get()
+
+            async def send(self, message):
+                request = json.loads(message)
+                method = request["method"]
+                if method == "initialized":
+                    self.messages.put_nowait(json.dumps({
+                        "method": "thread/started",
+                        "params": {"thread": thread("event-only")},
+                    }))
+                    return
+                result = {} if method == "initialize" else await rpc.call(method, request["params"])
+                self.messages.put_nowait(json.dumps({"id": request["id"], "result": result}))
+
+        url = "ws://127.0.0.1:4500"
+        output = io.StringIO()
+        with (
+            patch("sys.argv", ["assigner", "--url", url, "--backfill-once", "--token-env", "TEST_TOKEN"]),
+            patch.dict(os.environ, {"TEST_TOKEN": "test-token"}),
+            patch("codex_project_assigner.connect", return_value=WebSocket()) as connect_mock,
+            redirect_stdout(output),
+            self.assertRaises(SystemExit) as result,
+        ):
+            main()
+        self.assertEqual(result.exception.code, 0)
+        connect_mock.assert_called_once_with(
+            url, additional_headers={"Authorization": "Bearer test-token"}, max_size=8 * 1024 * 1024,
+        )
+        self.assertEqual(output.getvalue().strip(), "Backfill summary: assigned=1, skipped=0, failed=0")
+        self.assertFalse(any(params.get("threadId") == "event-only" for _, params in rpc.calls))
+        self.assertEqual(sum(method == "thread/list" for method, _ in rpc.calls), 2)
+
+    def test_cli_exits_on_connection_failure(self):
+        with (
+            patch("sys.argv", ["assigner", "--backfill-once"]),
+            patch("codex_project_assigner.connect", side_effect=OSError("connection failed")) as connect_mock,
+            self.assertLogs("codex-project-assigner", "ERROR"),
+            self.assertRaises(SystemExit) as result,
+        ):
+            main()
+        self.assertEqual(result.exception.code, 1)
+        connect_mock.assert_called_once()
 
 # Separate end-to-end transport smoke test, simulating an already-running server.
 from codex_project_assigner import run_connection
@@ -251,3 +459,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                     with self.assertRaises(asyncio.CancelledError):
                         await task
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

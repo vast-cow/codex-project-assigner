@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Auto-assign new Codex App Server threads to projects by exact cwd/root match.
+"""Assign Codex App Server threads to projects by exact cwd/root match.
 
 Requires Python 3.11+ and websockets>=14,<17.
 Connects to an ALREADY RUNNING app-server via WebSocket or a Unix control socket;
@@ -19,7 +19,7 @@ import posixpath
 import time
 import uuid
 from urllib.parse import urlsplit
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
 from typing import Any
 
@@ -67,9 +67,10 @@ class JsonRpcClient:
 
     NOTIFICATIONS = {"thread/started", "project/changed"}
 
-    def __init__(self, websocket: Any, *, timeout: float = 20.0):
+    def __init__(self, websocket: Any, *, timeout: float = 20.0, watch_events: bool = True):
         self.ws = websocket
         self.timeout = timeout
+        self.watch_events = watch_events
         self._counter = 0
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=4096)
@@ -144,7 +145,7 @@ class JsonRpcClient:
                         "id": msg["id"],
                         "error": {"code": -32601, "message": "Method not supported"},
                     })
-                elif msg.get("method") in self.NOTIFICATIONS:
+                elif self.watch_events and msg.get("method") in self.NOTIFICATIONS:
                     try:
                         self.events.put_nowait(msg)
                     except asyncio.QueueFull:
@@ -164,8 +165,9 @@ class JsonRpcClient:
 class ProjectAssigner:
     """One-writer, cache-first CWD matching with serialization per CWD."""
 
-    def __init__(self, rpc: Any):
+    def __init__(self, rpc: Any, *, backfill: bool = False):
         self.rpc = rpc
+        self.backfill = backfill
         self.projects: list[dict[str, Any]] = []
         self.cache_valid = False
         self._project_mutex = asyncio.Lock()
@@ -265,50 +267,47 @@ class ProjectAssigner:
                     raise ValueError("thread/read returned no thread")
                 return thread
             except RpcError as exc:
-                if "thread not found" not in exc.message.lower():
+                if self.backfill or "thread not found" not in exc.message.lower():
                     raise
                 if attempt < 4:
                     await asyncio.sleep(0.25 * (2**attempt))
         LOG.warning("Thread %s not readable yet; reconciliation will retry", thread_id)
         return None
 
-    async def process_thread(self, thread: Mapping[str, Any]) -> None:
+    async def process_thread(self, thread: Mapping[str, Any]) -> bool:
+        """Return whether this call assigned a project."""
         tid = thread.get("id")
         if not isinstance(tid, str) or not tid:
-            return
-        if thread.get("projectId") or thread.get("ephemeral") is True:
-            return
+            return False
+        if thread.get("projectId") is not None or thread.get("ephemeral") is True:
+            return False
         # Serializes duplicate deliveries for the same thread.
         lock = self._thread_locks.setdefault(tid, asyncio.Lock())
         async with lock:
             current = await self._read_thread(tid)
-            if current is None or current.get("projectId") or current.get("ephemeral") is True:
-                return
-            cwd = current.get("cwd") or thread.get("cwd")
+            if current is None or current.get("projectId") is not None or current.get("ephemeral") is True:
+                return False
+            cwd = current.get("cwd")
+            if not cwd and not self.backfill:
+                cwd = thread.get("cwd")
             try:
                 key = normalized_path(cwd)
             except (TypeError, ValueError):
                 LOG.warning("Thread %s has no valid absolute cwd: %r", tid, cwd)
-                return
+                return False
             cwd_lock = self._cwd_locks.setdefault(key, asyncio.Lock())
             async with cwd_lock:
                 # Recheck authoritative assignment while holding lock.
                 current = await self._read_thread(tid)
-                if current is None or current.get("projectId") or current.get("ephemeral") is True:
-                    return
-                latest_cwd = current.get("cwd") or cwd
-                if normalized_path(latest_cwd) != key:
-                    LOG.warning("Thread %s changed cwd while assigning; deferred to reconciliation", tid)
-                    return
+                if current is None or current.get("projectId") is not None or current.get("ephemeral") is True:
+                    return False
+                latest_cwd = current.get("cwd") or (None if self.backfill else cwd)
+                if not self._cwd_matches(tid, latest_cwd, key):
+                    return False
                 project = await self._get_or_create_project(latest_cwd)
-                # Narrow the TOCTOU window before the non-conditional update.
-                # The API does not expose a compare-and-set for projectId.
-                before_write = await self._read_thread(tid)
-                if before_write is None or before_write.get("projectId"):
-                    return
-                if normalized_path(before_write.get("cwd") or latest_cwd) != key:
-                    LOG.warning("Thread %s cwd changed before update; skipped", tid)
-                    return
+                fallback_cwd = None if self.backfill else latest_cwd
+                if not await self._can_update(tid, key, fallback_cwd):
+                    return False
                 try:
                     result = await self.rpc.call(
                         "thread/metadata/update", {"threadId": tid, "projectId": project["id"]}
@@ -319,6 +318,8 @@ class ProjectAssigner:
                     # Stale project cache: invalidate and retry from server state.
                     self.invalidate_projects()
                     project = await self._get_or_create_project(latest_cwd)
+                    if not await self._can_update(tid, key, fallback_cwd):
+                        return False
                     result = await self.rpc.call(
                         "thread/metadata/update", {"threadId": tid, "projectId": project["id"]}
                     )
@@ -326,32 +327,36 @@ class ProjectAssigner:
                 if actual_id != project["id"]:
                     raise ValueError(f"Project update not verified for thread {tid}: {actual_id!r}")
                 LOG.info("Assigned thread %s -> project %s (cwd=%s)", tid, actual_id, latest_cwd)
+                return True
 
-    async def reconcile_since(self, cutoff_unix_seconds: int) -> None:
-        """Recover missed events; do NOT rewrite older, historical unassigned threads."""
+    def _cwd_matches(self, tid: str, cwd: Any, key: str) -> bool:
+        try:
+            if normalized_path(cwd) == key:
+                return True
+        except ValueError:
+            pass
+        LOG.warning("Thread %s changed cwd or has no valid absolute cwd; skipped", tid)
+        return False
+
+    async def _can_update(self, tid: str, key: str, fallback_cwd: str | None) -> bool:
+        # The API does not expose a compare-and-set for projectId.
+        current = await self._read_thread(tid)
+        if current is None or current.get("projectId") is not None or current.get("ephemeral") is True:
+            return False
+        return self._cwd_matches(tid, current.get("cwd") or fallback_cwd, key)
+
+    async def _unassigned_thread_pages(self, **filters: Any) -> AsyncIterator[list[Any]]:
         cursor: str | None = None
         cursors_seen: set[str] = set()
         while True:
-            params: dict[str, Any] = {"projectId": None, "limit": 100}
+            params = {"projectId": None, "limit": 100, **filters}
             if cursor is not None:
                 params["cursor"] = cursor
             response = await self.rpc.call("thread/list", params)
             threads = response.get("data")
             if not isinstance(threads, list):
                 raise ValueError("thread/list returned invalid data")
-            old_thread_reached = False
-            for thread in threads:
-                if not isinstance(thread, dict):
-                    continue
-                created_at = thread.get("createdAt")
-                if not isinstance(created_at, (int, float)):
-                    continue
-                if created_at < cutoff_unix_seconds:
-                    old_thread_reached = True
-                    break
-                await self.process_thread(thread)
-            if old_thread_reached:
-                return
+            yield threads
             cursor = response.get("nextCursor")
             if cursor is None:
                 return
@@ -359,18 +364,72 @@ class ProjectAssigner:
                 raise ValueError("thread/list returned invalid/repeated nextCursor")
             cursors_seen.add(cursor)
 
+    async def reconcile_since(self, cutoff_unix_seconds: int) -> None:
+        """Recover missed events; do NOT rewrite older, historical unassigned threads."""
+        async for threads in self._unassigned_thread_pages():
+            for thread in threads:
+                if not isinstance(thread, dict):
+                    continue
+                created_at = thread.get("createdAt")
+                if not isinstance(created_at, (int, float)):
+                    continue
+                if created_at < cutoff_unix_seconds:
+                    return
+                await self.process_thread(thread)
+
+    async def backfill_once(self) -> int:
+        assigned = skipped = failed = 0
+        # Listing must finish before assignments can change the paginated result set.
+        candidates: dict[str, bool] = {}
+        source_kinds = [
+            "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
+            "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
+        ]
+        try:
+            for archived in (False, True):
+                async for threads in self._unassigned_thread_pages(
+                    archived=archived, modelProviders=[], sourceKinds=source_kinds,
+                ):
+                    for thread in threads:
+                        tid = thread.get("id") if isinstance(thread, dict) else None
+                        if not isinstance(tid, str) or not tid:
+                            LOG.error("Backfill received a thread without a valid ID")
+                            failed += 1
+                            continue
+                        if thread.get("projectId") is not None or thread.get("ephemeral") is True:
+                            candidates[tid] = False
+                        else:
+                            candidates.setdefault(tid, True)
+        except Exception:
+            LOG.exception("Backfill could not finish listing threads")
+            return 1
+        else:
+            for tid, eligible in candidates.items():
+                try:
+                    if eligible and await self.process_thread({"id": tid}):
+                        assigned += 1
+                    else:
+                        skipped += 1
+                except Exception:
+                    LOG.exception("Backfill could not assign thread %s", tid)
+                    failed += 1
+            return int(failed > 0)
+        finally:
+            print(f"Backfill summary: assigned={assigned}, skipped={skipped}, failed={failed}")
+
 
 async def run_connection(
-    ws: Any, *, request_timeout: float, lookback_cutoff: int, reconcile_interval: float
-) -> None:
-    rpc = JsonRpcClient(ws, timeout=request_timeout)
+    ws: Any, *, request_timeout: float, lookback_cutoff: int, reconcile_interval: float,
+    backfill_once: bool = False,
+) -> int:
+    rpc = JsonRpcClient(ws, timeout=request_timeout, watch_events=not backfill_once)
     rpc.start()
     background: set[asyncio.Task[Any]] = set()
     limiter = asyncio.Semaphore(16)
     reconciliation: asyncio.Task[Any] | None = None
     try:
         await rpc.initialize()
-        assigner = ProjectAssigner(rpc)
+        assigner = ProjectAssigner(rpc, backfill=backfill_once)
         try:
             await assigner.refresh_projects()
         except RpcError as exc:
@@ -380,6 +439,9 @@ async def run_connection(
                     "Upgrade Codex or enable the project-capable thread store."
                 ) from exc
             raise
+
+        if backfill_once:
+            return await assigner.backfill_once()
 
         async def assign_with_log(thread: dict[str, Any]) -> None:
             async with limiter:
@@ -428,8 +490,8 @@ async def run_connection(
         await rpc.close()
 
 
-async def main_async(args: argparse.Namespace) -> None:
-    cutoff = int(time.time()) - args.lookback_seconds
+async def main_async(args: argparse.Namespace) -> int:
+    cutoff = 0 if args.backfill_once else int(time.time()) - args.lookback_seconds
     delay = 1.0
     while True:
         try:
@@ -445,17 +507,23 @@ async def main_async(args: argparse.Namespace) -> None:
             async with connection as ws:
                 LOG.info("Connected to existing Codex App Server")
                 delay = 1.0
-                await run_connection(
+                status = await run_connection(
                     ws,
                     request_timeout=args.request_timeout,
                     lookback_cutoff=cutoff,
                     reconcile_interval=args.reconcile_interval,
+                    backfill_once=args.backfill_once,
                 )
+                if args.backfill_once:
+                    return status
         except asyncio.CancelledError:
             raise
         except UnsupportedAppServer:
             raise
         except Exception as exc:
+            if args.backfill_once:
+                LOG.error("Backfill failed: %s", exc)
+                return 1
             LOG.error("Disconnected or failed: %s; retrying in %.1fs", exc, delay)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30.0)
@@ -470,6 +538,10 @@ def main() -> None:
     parser.add_argument("--request-timeout", type=float, default=20)
     parser.add_argument("--reconcile-interval", type=float, default=60)
     parser.add_argument("--lookback-seconds", type=int, default=300)
+    parser.add_argument(
+        "--backfill-once", action="store_true",
+        help="Assign existing unassigned threads of any age, then exit",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     if not args.unix_socket:
@@ -480,16 +552,19 @@ def main() -> None:
             "localhost", "127.0.0.1", "::1"
         ):
             parser.error("non-local endpoints require wss:// (or use a local SSH tunnel)")
-    if args.request_timeout <= 0 or args.reconcile_interval <= 0 or args.lookback_seconds < 0:
+    if args.request_timeout <= 0 or (
+        not args.backfill_once and (args.reconcile_interval <= 0 or args.lookback_seconds < 0)
+    ):
         parser.error("timeouts/interval must be positive; lookback must be >= 0")
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
     try:
-        asyncio.run(main_async(args))
+        raise SystemExit(asyncio.run(main_async(args)))
     except KeyboardInterrupt:
-        pass
+        if args.backfill_once:
+            raise SystemExit(130)
     except UnsupportedAppServer as exc:
         parser.exit(2, f"{exc}\n")
 
